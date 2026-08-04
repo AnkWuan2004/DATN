@@ -29,7 +29,7 @@ class ROIExtractor:
 
         y2 = int(
             shoulder_y +
-            (hip_y - shoulder_y) * 0.30
+            (hip_y - shoulder_y) * 0.35
         )
 
         return x1, y1, x2, y2

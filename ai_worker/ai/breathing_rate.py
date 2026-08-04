@@ -14,6 +14,12 @@ class BreathingRateEstimator:
     Ban moi: distance tinh theo THOI GIAN THUC (tu fps = len(signal)/
     duration_seconds), va them prominence -- chi tinh la peak khi noi
     bat ro rang so voi muc dao dong chung cua tin hieu.
+
+    FIX: dung np.atleast_1d() thay vi np.asarray() truc tiep de tranh
+    loi "TypeError: len() of unsized object" khi tham so signal truyen
+    vao vo tinh la scalar hoac mang 0-chieu (co the xay ra neu ham loc
+    phia truoc tra ve gia tri khong dung dang, dac biet o fps rat
+    thap/khong on dinh nhu ESP32-CAM qua WiFi yeu).
     """
 
     # Nguoi thuc te tho khoang 5-40 lan/phut -> 1 nhip cach nhau toi
@@ -29,16 +35,26 @@ class BreathingRateEstimator:
 
     @staticmethod
     def estimate(signal, duration_seconds):
-        signal = np.asarray(signal, dtype=float)
+        # FIX: atleast_1d dam bao signal luon la mang >=1 chieu, tranh
+        # crash "len() of unsized object" neu dau vao la scalar/0-d.
+        signal = np.atleast_1d(np.asarray(signal, dtype=float))
 
-        if len(signal) == 0 or duration_seconds <= 0:
+        if signal.size == 0 or duration_seconds is None or duration_seconds <= 0:
             return 0.0, []
 
-        fps = len(signal) / duration_seconds
+        # Bo cac gia tri NaN/Inf neu co (vd loc bandpass loi cuc bo)
+        if not np.all(np.isfinite(signal)):
+            signal = signal[np.isfinite(signal)]
+            if signal.size == 0:
+                return 0.0, []
+
+        fps = signal.size / duration_seconds
         min_distance_samples = max(
             1,
             int(fps * BreathingRateEstimator.MIN_SECONDS_BETWEEN_BREATHS)
         )
+        # find_peaks yeu cau distance < do dai tin hieu
+        min_distance_samples = min(min_distance_samples, max(1, signal.size - 1))
 
         signal_std = float(np.std(signal))
         prominence = (

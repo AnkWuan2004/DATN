@@ -1,22 +1,28 @@
 """
 breathing_worker.py
 --------------------
-Ho tro 2 nguon camera:
-    1. Laptop webcam:  --camera 0   (mac dinh)
-    2. ESP32-CAM:      --espcam http://192.168.x.x/stream
+Chi dung ESP32-CAM (khong con dung webcam laptop nua).
 
-Khi dung ESP32-CAM, script tu dong:
-    - Mo stream MJPEG qua HTTP thay vi USB.
-    - Tang do nhieu loc (GaussianBlur 7x7 thay vi 5x5) vi JPEG artifact
-      tu ESP32-CAM nhieu hon ảnh raw tu webcam.
+Cach dung:
+    1. Sua bien ESPCAM_URL o duoi day thanh dia chi IP that cua
+       ESP32-CAM nha ban, vd: "http://192.168.1.50/stream"
+    2. Chay truc tiep, khong can them tham so gi ca:
+           python breathing_worker.py
+
+Cac tham so khac (API, interval, roi...) van co the truyen qua dong
+lenh neu muon, nhung KHONG BAT BUOC, vi da co gia tri mac dinh hop ly.
+
+Script tu dong:
+    - Mo stream MJPEG cua ESP32-CAM qua HTTP.
+    - Dung GaussianBlur 7x7 (thay vi 5x5) vi JPEG artifact tu ESP32-CAM
+      nhieu hon ảnh raw tu webcam, Farneback rat nhay voi block artifact.
     - Tu dong ket noi lai neu ESP32-CAM mat mang hoac reboot.
     - In canh bao neu FPS trung binh qua thap (<5) de nguoi dung biet
       chat luong tin hieu co the bi anh huong.
 
 Do chinh xac cua mo hinh (bandpass 0.1-0.5Hz, prominence, distance)
-KHONG thay doi -- cac tham so nay da duoc thiet ke theo thoi gian thuc
-(tu tinh fps tu chinh du lieu), nen tu dong thich nghi voi FPS thap
-hon cua ESP32-CAM ma khong can chinh tay.
+KHONG thay doi -- cac tham so nay tu tinh fps tu chinh du lieu, nen
+tu dong thich nghi voi FPS thap cua ESP32-CAM ma khong can chinh tay.
 """
 
 import argparse
@@ -24,31 +30,39 @@ import time
 
 import cv2
 import matplotlib.pyplot as plt
+import numpy as np
 import requests
 from ultralytics import YOLO
-
+import os
+from datetime import datetime
 from ai.roi_extractor import ROIExtractor
 from ai.motion_tracker import MotionTracker
 from ai.signal_filter import SignalFilter
 from ai.breathing_rate import BreathingRateEstimator
 
 
+# ==================================================================
+# SUA DONG NAY: dia chi stream cua ESP32-CAM nha ban
+# ==================================================================
+ESPCAM_URL = "http://172.20.10.4/stream"
+
+CAPTURE_DIR = "captures"
+os.makedirs(CAPTURE_DIR, exist_ok=True)
 # ----------------------------------------------------------------
 def parse_args():
-    parser = argparse.ArgumentParser(description="Breathing rate worker -> push to API")
+    parser = argparse.ArgumentParser(
+        description="Breathing rate worker (ESP32-CAM only) -> push to API"
+    )
     parser.add_argument(
         "--api", default="http://127.0.0.1:5000",
         help="Base URL cua Flask backend (mac dinh http://127.0.0.1:5000)"
     )
     parser.add_argument(
-        "--camera", type=int, default=0,
-        help="Chi so camera USB/laptop (mac dinh 0). Bo qua neu dung --espcam."
-    )
-    parser.add_argument(
-        "--espcam", type=str, default=None,
+        "--espcam", type=str, default=ESPCAM_URL,
         help=(
-            "URL MJPEG stream cua ESP32-CAM, vd: http://192.168.1.50/stream. "
-            "Neu truyen tham so nay, --camera se bi bo qua."
+            "URL MJPEG stream cua ESP32-CAM. Mac dinh lay tu bien "
+            f"ESPCAM_URL trong file ({ESPCAM_URL}). Chi can truyen "
+            "tham so nay neu muon ghi de tam thoi."
         )
     )
     parser.add_argument(
@@ -63,39 +77,37 @@ def parse_args():
         "--roi-smoothing", type=float, default=0.3,
         help="He so lam muot EMA khi ROI di chuyen, 0-1 (mac dinh 0.3)"
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    args.espcam = args.espcam.strip()
+    if not args.espcam or not (
+        args.espcam.startswith("http://") or args.espcam.startswith("https://")
+    ):
+        parser.error(
+            f"URL ESP32-CAM khong hop le: {args.espcam!r}\n"
+            "Sua bien ESPCAM_URL o dau file, hoac truyen --espcam http://IP/stream"
+        )
+
+    return args
 
 
 # ----------------------------------------------------------------
-# Mo camera: ho tro ca USB va ESP32-CAM MJPEG qua HTTP
+# Mo stream ESP32-CAM
 # ----------------------------------------------------------------
-def open_capture(args):
-    """
-    Tra ve (cap, is_espcam).
-    is_espcam=True: can xu ly reconnect va kiem tra FPS rieng.
-    """
-    if args.espcam:
-        url = args.espcam.strip()
-        print(f"[worker] Dang ket noi toi ESP32-CAM: {url}")
-        cap = cv2.VideoCapture(url)
-        # Giam buffer cua OpenCV xuong 2 frame: tranh doc frame cu tich
-        # dong trong hang cho khi xu ly cham (YOLO nang) -> giam do tre.
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
-        if not cap.isOpened():
-            raise RuntimeError(
-                f"Khong mo duoc stream ESP32-CAM tai {url}\n"
-                "Kiem tra: (1) ESP32-CAM da ket noi WiFi chua? "
-                "(2) Dung IP dung chua? (3) Mo http://IP/ping tren browser xem co tra 'OK' khong?"
-            )
-        print(f"[worker] Da ket noi ESP32-CAM: {url}")
-        return cap, True
-
-    cap = cv2.VideoCapture(args.camera)
+def open_capture(url):
+    print(f"[worker] Dang ket noi toi ESP32-CAM: {url}")
+    cap = cv2.VideoCapture(url)
+    # Giam buffer cua OpenCV xuong 2 frame: tranh doc frame cu tich
+    # dong trong hang cho khi xu ly cham (YOLO nang) -> giam do tre.
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
     if not cap.isOpened():
-        raise RuntimeError(f"Khong mo duoc camera so {args.camera}")
-    print(f"[worker] Da mo webcam so {args.camera}")
-    return cap, False
+        raise RuntimeError(
+            f"Khong mo duoc stream ESP32-CAM tai {url}\n"
+            "Kiem tra: (1) ESP32-CAM da ket noi WiFi chua? "
+            "(2) Dung IP dung chua? (3) Mo http://IP/ping tren browser xem co tra 'OK' khong?"
+        )
+    print(f"[worker] Da ket noi ESP32-CAM: {url}")
+    return cap
 
 
 def reopen_espcam(url, max_retries=10, wait_sec=3.0):
@@ -139,35 +151,59 @@ def detect_chest_roi(model, roi_extractor, frame):
     return None
 
 
-def push_bpm(api_base, bpm_value):
+def push_bpm(api_base, bpm_value, frame):
     url = f"{api_base}/api/breathing"
+
+    image_path = None
+
+    # Chỉ lưu ảnh khi BPM vượt ngưỡng
+    if bpm_value > 25 or bpm_value < 5:
+        filename = datetime.now().strftime("%Y%m%d_%H%M%S.jpg")
+        image_path = os.path.join(CAPTURE_DIR, filename)
+        cv2.imwrite(image_path, frame)
+
+    detect_time = datetime.now()
+
+    print("=" * 60)
+    print(f"[Worker] Phát hiện cảnh báo : {detect_time:%Y-%m-%d %H:%M:%S}")
+    print(f"[Worker] BPM              : {bpm_value:.2f}")
+    print(f"[Worker] Ảnh              : {image_path}")
+    print("=" * 60)
+
+    payload = {
+        "bpm": round(bpm_value, 2),
+        "source": "camera_ai",
+        "image": image_path
+    }
+
     try:
         resp = requests.post(
             url,
-            json={"bpm": round(bpm_value, 2), "source": "camera_ai"},
+            json=payload,
             timeout=5,
         )
+
         if resp.status_code == 201:
-            print(f"[worker] Da gui BPM={bpm_value:.2f} len API")
+            print(f"[worker] Da gui BPM={bpm_value:.2f}")
+
         else:
-            print(f"[worker] API tra loi {resp.status_code}: {resp.text}")
+            print(resp.text)
+
     except requests.exceptions.RequestException as e:
-        print(f"[worker] Khong gui duoc len API: {e}")
-
-
+        print(e)
 # ----------------------------------------------------------------
 def main():
     args = parse_args()
-    cap, is_espcam = open_capture(args)
+    print(f"[worker] >>> Nguon camera: ESP32-CAM ({args.espcam})")
+
+    cap = open_capture(args.espcam)
 
     model = YOLO("yolo11n-pose.pt")
     roi_extractor = ROIExtractor()
 
-    # ESP32-CAM: dung blur manh hon (7x7) vi JPEG artifact nhieu hon
+    # Dung blur manh hon (7x7) vi JPEG artifact tu ESP32-CAM nhieu hon
     # anh raw tu webcam, Farneback rat nhay voi block artifact JPEG.
-    # Webcam: blur nhe (5x5) nhu truoc.
-    blur_kernel = (7, 7) if is_espcam else (5, 5)
-    tracker = MotionTracker(blur_kernel=blur_kernel)
+    tracker = MotionTracker(blur_kernel=(7, 7))
 
     current_roi = None
     frame_idx = 0
@@ -196,8 +232,7 @@ def main():
     fps_window_start = time.time()
     MIN_ACCEPTABLE_FPS = 5.0
 
-    src_label = f"ESP32-CAM ({args.espcam})" if is_espcam else f"Webcam {args.camera}"
-    print(f"[worker] Bat dau do nhip tho qua {src_label}")
+    print(f"[worker] Bat dau do nhip tho qua ESP32-CAM ({args.espcam})")
     print(f"[worker] Khoi {args.interval:.0f} giay, Esc de dung")
 
     try:
@@ -205,17 +240,12 @@ def main():
             ret, frame = cap.read()
 
             if not ret:
-                if is_espcam:
-                    print("[worker] Mat ket noi ESP32-CAM, dang thu ket noi lai...")
-                    cap.release()
-                    cap = reopen_espcam(args.espcam)
-                    fps_counter = 0
-                    fps_window_start = time.time()
-                    continue
-                else:
-                    print("[worker] Webcam khong tra frame, thu lai...")
-                    time.sleep(0.5)
-                    continue
+                print("[worker] Mat ket noi ESP32-CAM, dang thu ket noi lai...")
+                cap.release()
+                cap = reopen_espcam(args.espcam)
+                fps_counter = 0
+                fps_window_start = time.time()
+                continue
 
             frame_idx += 1
             fps_counter += 1
@@ -224,7 +254,7 @@ def main():
             elapsed_fps = time.time() - fps_window_start
             if elapsed_fps >= 10.0:
                 actual_fps = fps_counter / elapsed_fps
-                if is_espcam and actual_fps < MIN_ACCEPTABLE_FPS:
+                if actual_fps < MIN_ACCEPTABLE_FPS:
                     print(
                         f"[worker] CANH BAO: FPS trung binh {actual_fps:.1f} < {MIN_ACCEPTABLE_FPS}. "
                         "Tin hieu co the khong du de loc bandpass chinh xac. "
@@ -258,10 +288,8 @@ def main():
 
                 cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
-            # Hien thi nguon camera de phan biet
-            label = "ESP32-CAM" if is_espcam else "Webcam"
             cv2.putText(
-                display_frame, label, (20, display_frame.shape[0] - 15),
+                display_frame, "ESP32-CAM", (20, display_frame.shape[0] - 15),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1
             )
 
@@ -290,19 +318,45 @@ def main():
                             "BPM se duoc tinh nhung do chinh xac co the thap hon binh thuong."
                         )
 
-                    filtered_signal = SignalFilter.smooth(values, duration_seconds=duration)
-                    bpm, _peaks = BreathingRateEstimator.estimate(filtered_signal, duration)
+                    # FIX: boc try/except quanh buoc loc + tinh BPM. Truoc
+                    # day, neu gap truong hop bien (vd fps qua thap/khong
+                    # on dinh khien bandpass tra ve sai dang du lieu), loi
+                    # se CRASH toan bo worker. Gio neu 1 khoi loi, chi in
+                    # canh bao va BO QUA khoi do, worker van chay tiep.
+                    try:
+                        filtered_signal = SignalFilter.smooth(
+                            values, timestamps=timestamps, duration_seconds=duration
+                        )
+                        bpm, _peaks = BreathingRateEstimator.estimate(filtered_signal, duration)
+                    except Exception as e:
+                        print(
+                            f"[worker] LOI khi tinh BPM cho khoi nay, BO QUA khoi "
+                            f"va tiep tuc: {type(e).__name__}: {e}"
+                        )
+                        block_signal = []
+                        block_start_time = now
+                        continue
 
-                    push_bpm(args.api, bpm)
+                    push_bpm(
+                        args.api,
+                        bpm,
+                        display_frame.copy()
+                    )
                     print(
                         f"[worker] Respiration Rate: {bpm:.2f} BPM "
                         f"(fps={actual_fps_block:.1f}, frames={len(values)}, duration={duration:.1f}s)"
                     )
 
                     if plt.fignum_exists(fig.number):
-                        x_values = [t - timestamps[0] for t in timestamps]
-                        raw_line.set_data(x_values, values)
-                        filtered_line.set_data(x_values, filtered_signal)
+                        # filtered_signal co the da bi resample nen do dai
+                        # co the khac voi timestamps goc.
+                        x_raw = [t - timestamps[0] for t in timestamps]
+                        if len(filtered_signal) == len(x_raw):
+                            x_filtered = x_raw
+                        else:
+                            x_filtered = np.linspace(0, duration, len(filtered_signal))
+                        raw_line.set_data(x_raw, values)
+                        filtered_line.set_data(x_filtered, filtered_signal)
                         ax.relim()
                         ax.autoscale_view()
                         fig.canvas.draw()

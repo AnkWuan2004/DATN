@@ -2,7 +2,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 DATABASE_URL = (
-    "mysql+pymysql://root:123456@localhost/breathing_monitor"
+    "mysql+pymysql://root:123456789@localhost/breathing_monitor"
 )
 
 engine = create_engine(

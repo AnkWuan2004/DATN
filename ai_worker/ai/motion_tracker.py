@@ -43,7 +43,7 @@ class MotionTracker:
             None,
             0.5,   # pyr_scale
             3,     # levels
-            15,    # winsize: cua so tim kiem tuong quan
+            21,    # winsize: cua so tim kiem tuong quan
             3,     # iterations
             5,     # poly_n
             1.2,   # poly_sigma
